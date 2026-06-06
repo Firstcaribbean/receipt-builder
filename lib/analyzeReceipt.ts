@@ -3,7 +3,7 @@ import type { ReceiptField, ReceiptFieldSize, ReceiptFieldStyle, ReceiptFieldTyp
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MODEL = 'openrouter/free';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
-const OPENROUTER_TIMEOUT_MS = 45_000;
+const OPENROUTER_TIMEOUT_MS = 15_000;
 const FALLBACK_MODELS = ['qwen/qwen2.5-vl-72b-instruct:free', 'qwen/qwen3-vl-235b-a22b-thinking:free'];
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
@@ -121,8 +121,14 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
     } catch (error) {
       lastError = error instanceof Error ? error : new Error('Analysis failed.');
 
-      if (!isRetryableOpenRouterError(lastError.message) || model === models[models.length - 1]) {
+      if (!isRetryableOpenRouterError(lastError.message)) {
         throw lastError;
+      }
+
+      if (model === models[models.length - 1]) {
+        throw new Error(
+          `OpenRouter free models are busy or rate-limited right now. Wait a few minutes, add OpenRouter credits, or set OPENROUTER_MODEL to a paid vision-capable model. Last error: ${lastError.message}`
+        );
       }
 
       console.warn(`/api/analyze retrying OpenRouter with fallback model after ${model} failed:`, lastError.message);
