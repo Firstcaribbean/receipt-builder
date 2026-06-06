@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.82.0",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",
     "jsbarcode": "^3.11.5",

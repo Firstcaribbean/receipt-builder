@@ -1,5 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { ReceiptField, ReceiptFieldSize, ReceiptFieldStyle, ReceiptFieldType, ReceiptImage, ReceiptLayout } from './types';
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const DEFAULT_MODEL = 'openrouter/free';
+const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
 
@@ -33,7 +36,23 @@ const FIELD_TYPES = new Set<ReceiptFieldType>(['text', 'date', 'number', 'image'
 const FIELD_STYLES = new Set<ReceiptFieldStyle>(['bold', 'normal', 'italic']);
 const FIELD_SIZES = new Set<ReceiptFieldSize>(['large', 'medium', 'small']);
 
-let anthropicClient: Anthropic | null = null;
+type OpenRouterContent =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
+  | { type: 'file'; file: { filename: string; file_data: string } };
+
+interface OpenRouterResponse {
+  choices?: {
+    message?: {
+      content?: string | { type?: string; text?: string }[];
+    };
+    text?: string;
+    error?: { message?: string };
+  }[];
+  error?: {
+    message?: string;
+  };
+}
 
 export async function analyzeReceipt(base64: string, mediaType: string): Promise<ReceiptLayout> {
   if (!base64) {
@@ -48,60 +67,98 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
     throw new Error('Unsupported file type.');
   }
 
-  const client = getAnthropicClient();
-  const isPDF = mediaType === 'application/pdf';
-  const documentBlock = isPDF
-    ? {
-        type: 'document',
-        source: { type: 'base64', media_type: mediaType, data: base64 }
-      }
-    : {
-        type: 'image',
-        source: { type: 'base64', media_type: mediaType, data: base64 }
-      };
+  const apiKey = process.env.OPENROUTER_API_KEY;
 
-  const message = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          documentBlock,
-          {
-            type: 'text',
-            text: ANALYSIS_PROMPT
+  if (!apiKey || apiKey === 'your_key_here') {
+    throw new Error('OPENROUTER_API_KEY is not configured.');
+  }
+
+  const isPDF = mediaType === 'application/pdf';
+  const content: OpenRouterContent[] = [
+    { type: 'text', text: ANALYSIS_PROMPT },
+    isPDF
+      ? {
+          type: 'file',
+          file: {
+            filename: 'receipt-template.pdf',
+            file_data: `data:application/pdf;base64,${base64}`
           }
-        ] as any
-      }
-    ]
+        }
+      : {
+          type: 'image_url',
+          image_url: {
+            url: `data:${mediaType};base64,${base64}`,
+            detail: 'high'
+          }
+        }
+  ];
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
+      'X-OpenRouter-Title': 'Receipt Template Builder'
+    },
+    body: JSON.stringify({
+      model: process.env.OPENROUTER_MODEL || DEFAULT_MODEL,
+      max_tokens: 2000,
+      messages: [
+        {
+          role: 'user',
+          content
+        }
+      ],
+      ...(isPDF
+        ? {
+            plugins: [
+              {
+                id: 'file-parser',
+                pdf: {
+                  engine: process.env.OPENROUTER_PDF_ENGINE || DEFAULT_PDF_ENGINE
+                }
+              }
+            ]
+          }
+        : {})
+    })
   });
 
-  const raw = message.content
-    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && 'text' in block)
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+  const data = (await response.json()) as OpenRouterResponse;
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error?.message || `OpenRouter returned ${response.status}.`);
+  }
+
+  const raw = extractOpenRouterText(data);
 
   if (!raw) {
-    throw new Error('Claude returned an empty analysis.');
+    throw new Error('OpenRouter returned an empty analysis.');
   }
 
   return normalizeReceiptLayout(parseLayoutJson(raw));
 }
 
-function getAnthropicClient(): Anthropic {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+function extractOpenRouterText(data: OpenRouterResponse): string {
+  const choice = data.choices?.[0];
 
-  if (!apiKey || apiKey === 'your_key_here') {
-    throw new Error('ANTHROPIC_API_KEY is not configured.');
+  if (choice?.error?.message) {
+    throw new Error(choice.error.message);
   }
 
-  if (!anthropicClient) {
-    anthropicClient = new Anthropic({ apiKey });
+  if (typeof choice?.message?.content === 'string') {
+    return choice.message.content.trim();
   }
 
-  return anthropicClient;
+  if (Array.isArray(choice?.message?.content)) {
+    return choice.message.content
+      .map((part) => (part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
+      .join('\n')
+      .trim();
+  }
+
+  return choice?.text?.trim() || '';
 }
 
 function parseLayoutJson(raw: string): unknown {
@@ -117,7 +174,7 @@ function parseLayoutJson(raw: string): unknown {
       return JSON.parse(clean.slice(start, end + 1));
     }
 
-    throw new Error('Claude response was not valid JSON.');
+    throw new Error('OpenRouter response was not valid JSON.');
   }
 }
 
