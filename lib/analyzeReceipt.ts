@@ -7,6 +7,7 @@ const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
 const OPENROUTER_TIMEOUT_MS = 15_000;
 const GEMINI_TIMEOUT_MS = 45_000;
+const MAX_OUTPUT_TOKENS = 8192;
 const FALLBACK_MODELS = ['qwen/qwen2.5-vl-72b-instruct:free', 'qwen/qwen3-vl-235b-a22b-thinking:free'];
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
@@ -36,6 +37,102 @@ Return this structure:
 Detect visible fields, labels, tables, image placeholders, colors, font style, barcode or QR placement, footer text, and structural sections. Do not invent real payment validity or official status.
 
 Your entire response must be one valid JSON object. Do not include prose, headings, markdown fences, comments, or any text outside the JSON object.`;
+
+const RECEIPT_LAYOUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    title: { type: 'string' },
+    layout: { type: 'string' },
+    colors: {
+      type: 'object',
+      properties: {
+        background: { type: 'string' },
+        text: { type: 'string' },
+        border: { type: 'string' }
+      },
+      required: ['background', 'text', 'border']
+    },
+    font: {
+      type: 'object',
+      properties: {
+        family: { type: 'string' },
+        headerSize: { type: 'string' },
+        bodySize: { type: 'string' }
+      },
+      required: ['family', 'headerSize', 'bodySize']
+    },
+    fields: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          label: { type: 'string' },
+          type: { type: 'string' },
+          position: { type: 'string' },
+          style: { type: 'string' },
+          size: { type: 'string' }
+        },
+        required: ['id', 'label', 'type', 'position', 'style', 'size']
+      }
+    },
+    tables: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          position: { type: 'string' },
+          columns: { type: 'array', items: { type: 'string' } },
+          rowFields: { type: 'array', items: { type: 'string' } }
+        },
+        required: ['id', 'position', 'columns', 'rowFields']
+      }
+    },
+    images: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          type: { type: 'string' },
+          position: { type: 'string' }
+        },
+        required: ['id', 'type', 'position']
+      }
+    },
+    barcode: {
+      type: 'object',
+      properties: {
+        exists: { type: 'boolean' },
+        position: { type: 'string' },
+        sourceField: { type: 'string' }
+      },
+      required: ['exists', 'position', 'sourceField']
+    },
+    footer: {
+      type: 'object',
+      properties: {
+        exists: { type: 'boolean' },
+        text: { type: 'string' }
+      },
+      required: ['exists', 'text']
+    },
+    sections: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          position: { type: 'string' },
+          fields: { type: 'array', items: { type: 'string' } }
+        },
+        required: ['id', 'position', 'fields']
+      }
+    }
+  },
+  required: ['title', 'layout', 'colors', 'font', 'fields', 'tables', 'images', 'barcode', 'footer', 'sections']
+} as const;
 
 const ALLOWED_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'application/pdf']);
 const MAX_BASE64_LENGTH = 14_000_000;
@@ -210,8 +307,9 @@ async function analyzeWithGemini({
           }
         ],
         generationConfig: {
-          maxOutputTokens: 2000,
-          responseMimeType: 'application/json'
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          responseMimeType: 'application/json',
+          responseJsonSchema: RECEIPT_LAYOUT_SCHEMA
         }
       })
     },
@@ -254,7 +352,7 @@ async function analyzeWithModel({
     },
     body: JSON.stringify({
       model,
-      max_tokens: 2000,
+      max_tokens: MAX_OUTPUT_TOKENS,
       response_format: { type: 'json_object' },
       messages: [
         {
@@ -391,7 +489,7 @@ function parseLayoutJson(raw: string): unknown {
       return JSON.parse(clean.slice(start, end + 1));
     }
 
-    throw new Error(`OpenRouter model did not return layout JSON. Raw response started with: ${clean.slice(0, 180)}`);
+    throw new Error(`AI model did not return complete layout JSON. Raw response started with: ${clean.slice(0, 180)}`);
   }
 }
 
