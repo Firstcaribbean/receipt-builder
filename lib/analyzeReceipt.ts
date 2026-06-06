@@ -1,9 +1,12 @@
 import type { ReceiptField, ReceiptFieldSize, ReceiptFieldStyle, ReceiptFieldType, ReceiptImage, ReceiptLayout } from './types';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'openrouter/free';
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
 const OPENROUTER_TIMEOUT_MS = 15_000;
+const GEMINI_TIMEOUT_MS = 45_000;
 const FALLBACK_MODELS = ['qwen/qwen2.5-vl-72b-instruct:free', 'qwen/qwen3-vl-235b-a22b-thinking:free'];
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
@@ -60,6 +63,19 @@ interface OpenRouterResponse {
   };
 }
 
+interface GeminiResponse {
+  candidates?: {
+    content?: {
+      parts?: { text?: string }[];
+    };
+  }[];
+  error?: {
+    message?: string;
+    status?: string;
+    code?: number;
+  };
+}
+
 export async function analyzeReceipt(base64: string, mediaType: string): Promise<ReceiptLayout> {
   if (!base64) {
     throw new Error('Missing file data.');
@@ -73,12 +89,34 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
     throw new Error('Unsupported file type.');
   }
 
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 
-  if (!apiKey || apiKey === 'your_key_here') {
-    throw new Error('OPENROUTER_API_KEY is not configured.');
+  if (geminiApiKey && geminiApiKey !== 'your_key_here') {
+    return analyzeWithGemini({
+      apiKey: geminiApiKey,
+      base64,
+      mediaType,
+      model: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL
+    });
   }
 
+  if (!openRouterApiKey || openRouterApiKey === 'your_key_here') {
+    throw new Error('Set GEMINI_API_KEY for the free Gemini API, or OPENROUTER_API_KEY for OpenRouter.');
+  }
+
+  return analyzeWithOpenRouter({ apiKey: openRouterApiKey, base64, mediaType });
+}
+
+async function analyzeWithOpenRouter({
+  apiKey,
+  base64,
+  mediaType
+}: {
+  apiKey: string;
+  base64: string;
+  mediaType: string;
+}): Promise<ReceiptLayout> {
   const isPDF = mediaType === 'application/pdf';
   const content: OpenRouterContent[] = [
     { type: 'text', text: ANALYSIS_PROMPT },
@@ -138,6 +176,67 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
   throw lastError || new Error('Analysis failed.');
 }
 
+async function analyzeWithGemini({
+  apiKey,
+  base64,
+  mediaType,
+  model
+}: {
+  apiKey: string;
+  base64: string;
+  mediaType: string;
+  model: string;
+}): Promise<ReceiptLayout> {
+  const response = await fetchWithTimeout(
+    `${GEMINI_URL}/${encodeURIComponent(model)}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                inline_data: {
+                  mime_type: mediaType,
+                  data: base64
+                }
+              },
+              { text: ANALYSIS_PROMPT }
+            ]
+          }
+        ],
+        generationConfig: {
+          maxOutputTokens: 2000,
+          responseFormat: {
+            text: {
+              mimeType: 'application/json'
+            }
+          }
+        }
+      })
+    },
+    GEMINI_TIMEOUT_MS
+  );
+
+  const data = await readGeminiResponse(response);
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error?.message || `Gemini returned ${response.status}.`);
+  }
+
+  const raw = extractGeminiText(data);
+
+  if (!raw) {
+    throw new Error('Gemini returned an empty analysis.');
+  }
+
+  return normalizeReceiptLayout(parseLayoutJson(raw));
+}
+
 async function analyzeWithModel({
   apiKey,
   content,
@@ -195,9 +294,9 @@ function isRetryableOpenRouterError(message: string): boolean {
   return /429|rate-?limited|temporarily|provider returned error|timeout|timed out|overloaded/i.test(message);
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = OPENROUTER_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     return await fetch(url, {
@@ -206,12 +305,26 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
     });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('OpenRouter timed out. Try a smaller image/PDF or use a faster model.');
+      throw new Error('AI analysis timed out. Try a smaller image/PDF or use a faster model.');
     }
 
     throw error;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function readGeminiResponse(response: Response): Promise<GeminiResponse> {
+  const text = await response.text();
+
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text) as GeminiResponse;
+  } catch {
+    throw new Error(`Gemini returned a non-JSON API response: ${text.slice(0, 180)}`);
   }
 }
 
@@ -227,6 +340,15 @@ async function readOpenRouterResponse(response: Response): Promise<OpenRouterRes
   } catch {
     throw new Error(`OpenRouter returned a non-JSON API response: ${text.slice(0, 180)}`);
   }
+}
+
+function extractGeminiText(data: GeminiResponse): string {
+  return (
+    data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || '')
+      .join('\n')
+      .trim() || ''
+  );
 }
 
 function extractOpenRouterText(data: OpenRouterResponse): string {
