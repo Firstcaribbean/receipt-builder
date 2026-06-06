@@ -3,6 +3,7 @@ import type { ReceiptField, ReceiptFieldSize, ReceiptFieldStyle, ReceiptFieldTyp
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MODEL = 'openrouter/free';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
+const OPENROUTER_TIMEOUT_MS = 45_000;
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
 
@@ -28,7 +29,9 @@ Return this structure:
   ]
 }
 
-Detect visible fields, labels, tables, image placeholders, colors, font style, barcode or QR placement, footer text, and structural sections. Do not invent real payment validity or official status.`;
+Detect visible fields, labels, tables, image placeholders, colors, font style, barcode or QR placement, footer text, and structural sections. Do not invent real payment validity or official status.
+
+Your entire response must be one valid JSON object. Do not include prose, headings, markdown fences, comments, or any text outside the JSON object.`;
 
 const ALLOWED_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'application/pdf']);
 const MAX_BASE64_LENGTH = 14_000_000;
@@ -93,7 +96,7 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
         }
   ];
 
-  const response = await fetch(OPENROUTER_URL, {
+  const response = await fetchWithTimeout(OPENROUTER_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -104,6 +107,10 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
     body: JSON.stringify({
       model: process.env.OPENROUTER_MODEL || DEFAULT_MODEL,
       max_tokens: 2000,
+      response_format: { type: 'json_object' },
+      provider: {
+        require_parameters: true
+      },
       messages: [
         {
           role: 'user',
@@ -125,7 +132,7 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
     })
   });
 
-  const data = (await response.json()) as OpenRouterResponse;
+  const data = await readOpenRouterResponse(response);
 
   if (!response.ok || data.error) {
     throw new Error(data.error?.message || `OpenRouter returned ${response.status}.`);
@@ -138,6 +145,40 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
   }
 
   return normalizeReceiptLayout(parseLayoutJson(raw));
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('OpenRouter timed out. Try a smaller image/PDF or use a faster model.');
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readOpenRouterResponse(response: Response): Promise<OpenRouterResponse> {
+  const text = await response.text();
+
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text) as OpenRouterResponse;
+  } catch {
+    throw new Error(`OpenRouter returned a non-JSON API response: ${text.slice(0, 180)}`);
+  }
 }
 
 function extractOpenRouterText(data: OpenRouterResponse): string {
@@ -174,7 +215,7 @@ function parseLayoutJson(raw: string): unknown {
       return JSON.parse(clean.slice(start, end + 1));
     }
 
-    throw new Error('OpenRouter response was not valid JSON.');
+    throw new Error(`OpenRouter model did not return layout JSON. Raw response started with: ${clean.slice(0, 180)}`);
   }
 }
 

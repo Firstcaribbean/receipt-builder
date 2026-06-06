@@ -15,6 +15,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ layout });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Analysis failed.';
+    console.error('/api/analyze failed:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
