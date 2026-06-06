@@ -3,7 +3,7 @@ import type { ReceiptField, ReceiptFieldSize, ReceiptFieldStyle, ReceiptFieldTyp
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'openrouter/free';
-const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
 const OPENROUTER_TIMEOUT_MS = 15_000;
 const GEMINI_TIMEOUT_MS = 45_000;
@@ -97,7 +97,7 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
       apiKey: geminiApiKey,
       base64,
       mediaType,
-      model: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL
+      model: getGeminiModel()
     });
   }
 
@@ -211,11 +211,7 @@ async function analyzeWithGemini({
         ],
         generationConfig: {
           maxOutputTokens: 2000,
-          responseFormat: {
-            text: {
-              mimeType: 'application/json'
-            }
-          }
+          responseMimeType: 'application/json'
         }
       })
     },
@@ -288,6 +284,16 @@ async function analyzeWithModel({
 
 function getCandidateModels(primaryModel: string): string[] {
   return Array.from(new Set([primaryModel, ...FALLBACK_MODELS]));
+}
+
+function getGeminiModel(): string {
+  const model = process.env.GEMINI_MODEL?.trim();
+
+  if (!model || model === 'gemini-3.5-flash') {
+    return DEFAULT_GEMINI_MODEL;
+  }
+
+  return model;
 }
 
 function isRetryableOpenRouterError(message: string): boolean {
