@@ -54,6 +54,8 @@ interface OpenRouterResponse {
   }[];
   error?: {
     message?: string;
+    code?: string | number;
+    metadata?: unknown;
   };
 }
 
@@ -95,6 +97,19 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
           }
         }
   ];
+  const plugins = [
+    { id: 'response-healing' },
+    ...(isPDF
+      ? [
+          {
+            id: 'file-parser',
+            pdf: {
+              engine: process.env.OPENROUTER_PDF_ENGINE || DEFAULT_PDF_ENGINE
+            }
+          }
+        ]
+      : [])
+  ];
 
   const response = await fetchWithTimeout(OPENROUTER_URL, {
     method: 'POST',
@@ -108,34 +123,21 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
       model: process.env.OPENROUTER_MODEL || DEFAULT_MODEL,
       max_tokens: 2000,
       response_format: { type: 'json_object' },
-      provider: {
-        require_parameters: true
-      },
       messages: [
         {
           role: 'user',
           content
         }
       ],
-      ...(isPDF
-        ? {
-            plugins: [
-              {
-                id: 'file-parser',
-                pdf: {
-                  engine: process.env.OPENROUTER_PDF_ENGINE || DEFAULT_PDF_ENGINE
-                }
-              }
-            ]
-          }
-        : {})
+      plugins
     })
   });
 
   const data = await readOpenRouterResponse(response);
 
   if (!response.ok || data.error) {
-    throw new Error(data.error?.message || `OpenRouter returned ${response.status}.`);
+    const details = data.error ? ` ${JSON.stringify(data.error).slice(0, 240)}` : '';
+    throw new Error(`${data.error?.message || `OpenRouter returned ${response.status}.`}${details}`);
   }
 
   const raw = extractOpenRouterText(data);
