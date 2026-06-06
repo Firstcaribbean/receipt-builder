@@ -4,6 +4,7 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MODEL = 'openrouter/free';
 const DEFAULT_PDF_ENGINE = 'cloudflare-ai';
 const OPENROUTER_TIMEOUT_MS = 45_000;
+const FALLBACK_MODELS = ['qwen/qwen2.5-vl-72b-instruct:free', 'qwen/qwen3-vl-235b-a22b-thinking:free'];
 
 const ANALYSIS_PROMPT = `You are a document layout analyzer. Analyze this receipt template and return ONLY a valid JSON object with no markdown and no explanation. Describe its structure so a developer can rebuild a clearly marked sample template preview in HTML/CSS.
 
@@ -111,6 +112,37 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
       : [])
   ];
 
+  const models = getCandidateModels(process.env.OPENROUTER_MODEL || DEFAULT_MODEL);
+  let lastError: Error | null = null;
+
+  for (const model of models) {
+    try {
+      return await analyzeWithModel({ apiKey, content, model, plugins });
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error('Analysis failed.');
+
+      if (!isRetryableOpenRouterError(lastError.message) || model === models[models.length - 1]) {
+        throw lastError;
+      }
+
+      console.warn(`/api/analyze retrying OpenRouter with fallback model after ${model} failed:`, lastError.message);
+    }
+  }
+
+  throw lastError || new Error('Analysis failed.');
+}
+
+async function analyzeWithModel({
+  apiKey,
+  content,
+  model,
+  plugins
+}: {
+  apiKey: string;
+  content: OpenRouterContent[];
+  model: string;
+  plugins: unknown[];
+}): Promise<ReceiptLayout> {
   const response = await fetchWithTimeout(OPENROUTER_URL, {
     method: 'POST',
     headers: {
@@ -120,7 +152,7 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
       'X-OpenRouter-Title': 'Receipt Template Builder'
     },
     body: JSON.stringify({
-      model: process.env.OPENROUTER_MODEL || DEFAULT_MODEL,
+      model,
       max_tokens: 2000,
       response_format: { type: 'json_object' },
       messages: [
@@ -143,10 +175,18 @@ export async function analyzeReceipt(base64: string, mediaType: string): Promise
   const raw = extractOpenRouterText(data);
 
   if (!raw) {
-    throw new Error('OpenRouter returned an empty analysis.');
+    throw new Error(`OpenRouter returned an empty analysis from ${model}.`);
   }
 
   return normalizeReceiptLayout(parseLayoutJson(raw));
+}
+
+function getCandidateModels(primaryModel: string): string[] {
+  return Array.from(new Set([primaryModel, ...FALLBACK_MODELS]));
+}
+
+function isRetryableOpenRouterError(message: string): boolean {
+  return /429|rate-?limited|temporarily|provider returned error|timeout|timed out|overloaded/i.test(message);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
